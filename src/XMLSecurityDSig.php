@@ -55,6 +55,7 @@ class XMLSecurityDSig
     const SHA384 = 'http://www.w3.org/2001/04/xmldsig-more#sha384';
     const SHA512 = 'http://www.w3.org/2001/04/xmlenc#sha512';
     const RIPEMD160 = 'http://www.w3.org/2001/04/xmlenc#ripemd160';
+    const GOST3411 = 'http://www.w3.org/2001/04/xmldsig-more#gostr3411';
 
     const C14N = 'http://www.w3.org/TR/2001/REC-xml-c14n-20010315';
     const C14N_COMMENTS = 'http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments';
@@ -340,6 +341,9 @@ class XMLSecurityDSig
             case self::RIPEMD160:
                 $alg = 'ripemd160';
                 break;
+            case self::GOST3411:
+                $alg = 'gost-crypto';
+                break;
             default:
                 throw new Exception("Cannot validate digest: Unsupported Algorithm <$digestAlgorithm>");
         }
@@ -511,7 +515,9 @@ class XMLSecurityDSig
 
             $dataObject = $refNode->ownerDocument;
         }
+
         $data = $this->processTransforms($refNode, $dataObject, $includeCommentNodes);
+
         if (!$this->validateDigest($refNode, $data)) {
             return false;
         }
@@ -573,9 +579,7 @@ class XMLSecurityDSig
     {
         $docElem = $this->sigNode->ownerDocument->documentElement;
         if (! $docElem->isSameNode($this->sigNode)) {
-            if ($this->sigNode->parentNode != null) {
-                $this->sigNode->parentNode->removeChild($this->sigNode);
-            }
+            $this->sigNode->parentNode->removeChild($this->sigNode);
         }
         $xpath = $this->getXPathObj();
         $query = "./secdsig:SignedInfo/secdsig:Reference";

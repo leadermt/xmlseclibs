@@ -58,6 +58,7 @@ class XMLSecurityKey
     const RSA_SHA384 = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha384';
     const RSA_SHA512 = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha512';
     const HMAC_SHA1 = 'http://www.w3.org/2000/09/xmldsig#hmac-sha1';
+    const GOST_3411 = 'http://www.w3.org/2001/04/xmldsig-more#gostr34102001-gostr3411';
 
     /** @var array */
     private $cryptParams = array();
@@ -212,6 +213,16 @@ class XMLSecurityKey
                 $this->cryptParams['library'] = $type;
                 $this->cryptParams['method'] = 'http://www.w3.org/2000/09/xmldsig#hmac-sha1';
                 break;
+            case (self::GOST_3411):
+                $this->cryptParams['library'] = 'openssl-cli';
+                $this->cryptParams['method'] = 'http://www.w3.org/2001/04/xmldsig-more#gostr34102001-gostr3411';
+                if (is_array($params) && ! empty($params['type'])) {
+                    if ($params['type'] == 'public' || $params['type'] == 'private') {
+                        $this->cryptParams['type'] = $params['type'];
+                        break;
+                    }
+                }
+                break;
             default:
                 throw new Exception('Invalid Key Type');
         }
@@ -331,7 +342,46 @@ class XMLSecurityKey
         } else {
             $this->x509Certificate = null;
         }
-        if ($this->cryptParams['library'] == 'openssl') {
+        if ($this->cryptParams['library'] == 'openssl-cli') {
+            if ($isCert) {
+                if ($this->cryptParams['type'] == 'public') {
+                    /* Load the thumbprint if this is an X509 certificate. */
+                    $this->X509Thumbprint = self::getRawThumbprint($this->key);
+
+                    $openssl = proc_open(
+                        'openssl x509 -pubkey -noout',
+                        [
+                            0 => ["pipe", "r"],  // stdin - канал, из которого дочерний процесс будет читать
+                            1 => ["pipe", "w"],  // stdout - канал, в который дочерний процесс будет записывать
+                            2 => ["pipe", "r"] // stderr - файл для записи
+                        ],
+                        $pipes
+                    );
+
+                    if (is_resource($openssl)) {
+                        fwrite($pipes[0], $this->key);
+                    }
+                    fclose($pipes[0]);
+
+                    $key = stream_get_contents($pipes[1]);
+                    fclose($pipes[1]);
+
+                    $errors = stream_get_contents($pipes[2]);
+                    fclose($pipes[2]);
+
+                    $return_value = proc_close($openssl);
+                    if ($return_value || $errors) {
+                        throw new Exception('Unable to extract public key'."\n".$errors);
+                    }
+
+                    $this->key = $key;
+                } else {
+                    /**
+                     * Нужно дописать загрузку ключа из сертификата
+                     */
+                }
+            }
+        } else if ($this->cryptParams['library'] == 'openssl') {
             if ($this->cryptParams['type'] == 'public') {
                 if ($isCert) {
                     /* Load the thumbprint if this is an X509 certificate. */
@@ -472,6 +522,53 @@ class XMLSecurityKey
     }
 
     /**
+     * Signs the given data (string) using the openssl-extension
+     *
+     * @param string $data
+     * @return string
+     * @throws Exception
+     */
+    private function signOpenSSLCli($data)
+    {
+        $keyFilename = tempnam(sys_get_temp_dir(), 'signkey');
+        file_put_contents($keyFilename, $this->key);
+
+        $openssl = proc_open(
+            'openssl dgst -sign '.$keyFilename.' -binary ',
+            [
+                0 => ["pipe", "r"],  // stdin - канал, из которого дочерний процесс будет читать
+                1 => ["pipe", "w"],  // stdout - канал, в который дочерний процесс будет записывать
+                2 => ["pipe", "w"]   // stderr - файл для записи
+            ],
+            $pipes
+        );
+
+        if (is_resource($openssl)) {
+            fwrite($pipes[0], $data);
+        }
+        fclose($pipes[0]);
+
+        $result = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+
+        $errors = stream_get_contents($pipes[2]);
+        fclose($pipes[2]);
+
+        $return_value = proc_close($openssl);
+        unlink($keyFilename);
+
+        if ($errors){
+            throw  new Exception($errors);
+        }
+
+        if ($return_value){
+            throw new Exception("OpenSSL sign error");
+        }
+
+        return $result;
+    }
+
+    /**
      * Verifies the given data (string) belonging to the given signature using the openssl-extension
      *
      * @param string $data
@@ -485,6 +582,69 @@ class XMLSecurityKey
             $algo = $this->cryptParams['digest'];
         }
         return openssl_verify($data, $signature, $this->key, $algo);
+    }
+
+    private function getSessionSuffix()
+    {
+        static $key = false;
+        if ($key){
+            return $key;
+        }
+
+        $key = mt_rand(1000, 20000);
+        return $key;
+    }
+
+
+    /**
+     * Verifies the given data (string) belonging to the given signature using the openssl-cli
+     *
+     * @param string $data
+     * @param string $signature
+     * @return int
+     */
+    private function verifyOpenSSLCli($data, $signature)
+    {
+        $keyFilename = tempnam(sys_get_temp_dir(), 'verifykey');
+        $signatureFilename = tempnam(sys_get_temp_dir(), 'verifysign');
+
+        file_put_contents($signatureFilename, $signature);
+        file_put_contents($keyFilename, $this->key);
+
+        $openssl = proc_open(
+            'openssl dgst -verify '.$keyFilename.' -signature '.$signatureFilename,
+            [
+                0 => ["pipe", "r"],  // stdin - канал, из которого дочерний процесс будет читать
+                1 => ["pipe", "w"],  // stdout - канал, в который дочерний процесс будет записывать
+                2 => ["pipe", "w"]   // stderr - файл для записи
+            ],
+            $pipes
+        );
+
+        if (is_resource($openssl)) {
+            fwrite($pipes[0], $data);
+        }
+        fclose($pipes[0]);
+
+        $result = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+
+        $errors = stream_get_contents($pipes[2]);
+        fclose($pipes[2]);
+
+        $return_value = proc_close($openssl);
+        unlink($keyFilename);
+        unlink($signatureFilename);
+
+        if ($errors){
+            throw new Exception($errors);
+        }
+
+        if ($return_value){
+            throw new Exception($return_value);
+        }
+
+        return ($return_value === 0);
     }
 
     /**
@@ -530,6 +690,8 @@ class XMLSecurityKey
         switch ($this->cryptParams['library']) {
             case 'openssl':
                 return $this->signOpenSSL($data);
+            case 'openssl-cli':
+                return $this->signOpenSSLCli($data);
             case (self::HMAC_SHA1):
                 return hash_hmac("sha1", $data, $this->key, true);
         }
@@ -546,6 +708,8 @@ class XMLSecurityKey
         switch ($this->cryptParams['library']) {
             case 'openssl':
                 return $this->verifyOpenSSL($data, $signature);
+            case 'openssl-cli':
+                return $this->verifyOpenSSLCli($data, $signature);
             case (self::HMAC_SHA1):
                 $expectedSignature = hash_hmac("sha1", $data, $this->key, true);
                 return strcmp($signature, $expectedSignature) == 0;
